@@ -1,0 +1,153 @@
+# ============================================================
+#  TitanicSinks – Docker Compose
+#  Services: Airflow (webserver + scheduler) + PostgreSQL + MLflow
+#
+#  Usage:
+#    1.  Place the Titanic CSV in ./data/Titanic-Dataset.csv
+#    2.  docker compose up airflow-init   (first time only)
+#    3.  docker compose up -d
+#    4.  Airflow UI  → http://localhost:8080  (admin / admin)
+#    5.  MLflow UI   → http://localhost:5000
+#
+#  To stop:  docker compose down
+#  To reset: docker compose down -v   (also clears DB volumes)
+# ============================================================
+
+x-airflow-common: &airflow-common
+  build: .                    # uses Dockerfile in this directory
+  image: titanic-airflow:2.9.2  # cached image name after first build
+  environment: &airflow-common-env
+    # ── Core ─────────────────────────────────────────────────
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__CORE__FERNET_KEY: "46BKJoQYlPPOexq0OhDZnIlNepKFf87WFwLbfzqDDho="
+
+    # ── Database ──────────────────────────────────────────────
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+
+    # ── Webserver ─────────────────────────────────────────────
+    AIRFLOW__WEBSERVER__SECRET_KEY: "titanic-mlops-2024-secret"
+    AIRFLOW__WEBSERVER__EXPOSE_CONFIG: "true"
+
+    # ── MLflow tracking URI (Docker service name) ─────────────
+    MLFLOW_TRACKING_URI: "http://mlflow:5000"
+
+  volumes:
+    - ./dags:/opt/airflow/dags          # DAG files
+    - ./logs:/opt/airflow/logs          # Airflow task logs
+    - ./data:/opt/airflow/data          # Titanic CSV + processed pickles
+    - ./mlflow_artifacts:/mlflow/artifacts  # Shared with MLflow container
+
+  depends_on: &airflow-common-depends-on
+    postgres:
+      condition: service_healthy
+
+# ============================================================
+services:
+
+  # ── PostgreSQL (Airflow metadata store) ───────────────────
+  postgres:
+    image: postgres:15
+    container_name: titanic_postgres
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - postgres_db_volume:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 10s
+      retries: 5
+      start_period: 5s
+    restart: always
+
+  # ── Airflow Init (run once to create DB + admin user) ─────
+  airflow-init:
+    <<: *airflow-common
+    container_name: titanic_airflow_init
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        echo "Initialising Airflow DB..."
+        airflow db upgrade
+        echo "Creating admin user..."
+        airflow users create \
+          --username airflow \
+          --firstname Titanic \
+          --lastname Student \
+          --role Admin \
+          --email airflow@titanic.local \
+          --password airflow || true
+        echo " Airflow init complete."
+    environment:
+      <<: *airflow-common-env
+    restart: "no"
+
+  # ── Airflow Webserver ─────────────────────────────────────
+  airflow-webserver:
+    <<: *airflow-common
+    container_name: titanic_airflow_webserver
+    command: webserver
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+      mlflow:
+        condition: service_healthy
+
+  # ── Airflow Scheduler ─────────────────────────────────────
+  airflow-scheduler:
+    <<: *airflow-common
+    container_name: titanic_airflow_scheduler
+    command: scheduler
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8974/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+      mlflow:
+        condition: service_healthy
+
+  # ── MLflow Tracking Server (official pre-built image — starts in seconds) ───
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:v2.11.1
+    container_name: titanic_mlflow
+    command: >
+      mlflow server
+        --host 0.0.0.0
+        --port 5000
+        --backend-store-uri sqlite:////mlflow/db/mlflow.db
+        --default-artifact-root /mlflow/artifacts
+    ports:
+      - "5000:5000"
+    volumes:
+      - ./mlflow_db:/mlflow/db
+      - ./mlflow_artifacts:/mlflow/artifacts
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:5000/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+    restart: always
+
+# ── Named Volumes ─────────────────────────────────────────────
+volumes:
+  postgres_db_volume:
